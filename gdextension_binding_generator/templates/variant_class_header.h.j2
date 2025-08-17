@@ -67,12 +67,7 @@ class {{ cls.wrapper_name }} : public RefCounted {
 
   private:
     /* Wrapper-only mode: non-owning pointer to native impl (may be null). */
-    void* impl = nullptr;
-
-    // Internal bridge accessors (friend free functions; definitions below)
-    friend void* __ocgd_get_impl(const {{ cls.wrapper_name }}*);
-    friend void __ocgd_set_impl({{ cls.wrapper_name }}*, void*);
-    friend godot::Ref<{{ cls.wrapper_name }}> __ocgd_make_from_impl(void*);
+    {{ cls.absolute_qualified_name }}* impl = nullptr;
 
   protected:
     static void _bind_methods();
@@ -114,15 +109,5 @@ class {{ cls.wrapper_name }} : public RefCounted {
   {% endfor %}
 {% endif %}
 };
-
-// Inline friend accessor definitions for internal bridging
-inline void* __ocgd_get_impl(const {{ cls.wrapper_name }}* w) { return w ? w->impl : nullptr; }
-inline void __ocgd_set_impl({{ cls.wrapper_name }}* w, void* p) { if (w) w->impl = p; }
-inline godot::Ref<{{ cls.wrapper_name }}> __ocgd_make_from_impl(void* p) {
-    godot::Ref<{{ cls.wrapper_name }}> r;
-    r.instantiate();
-    __ocgd_set_impl(r.ptr(), p);
-    return r;
-}
 
 } // namespace godot

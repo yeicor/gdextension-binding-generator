@@ -611,16 +611,14 @@ class TypeMapper:
         if self.config.enable_std_string and _is_std_string(t.spelling):
             return self._string_param_mapping_std_string(t, pname)
 
-        # OCCT handle<T> parameter mapping -> opaque handle (uint64_t)
-        # Pass native as a dereferenced handle from the registry
+        # OCCT handle<T> parameter mapping disabled in simplified mode
         handle_type = _match_occt_handle_type(t.spelling)
         if handle_type:
             return MappedType(
                 native_spelling=_strip_cv_and_class_kw(t.spelling),
-                exposed_spelling="uint64_t",
-                kind=MappedKind.OPAQUE_HANDLE,
-                to_native_expr=f"*OpaqueHandleRegistry<{handle_type}>::get({{var}})",
-                notes=f"OCCT handle parameter mapped to opaque handle (registry of {handle_type})",
+                exposed_spelling="<unsupported>",
+                kind=MappedKind.UNSUPPORTED,
+                notes="OCCT handle<T> parameter not supported in simplified mode",
             )
 
         # void* parameter mapping -> intptr_t exposed
@@ -668,15 +666,7 @@ class TypeMapper:
                     default_exposed_value="0",
                     notes="Pointer to primitive mapped to intptr_t (no opaque handle needed)",
                 )
-            if self.config.enable_opaque_handles:
-                base_norm = _base_identifier(t.spelling)
-                return MappedType(
-                    native_spelling=_strip_cv_and_class_kw(t.spelling),
-                    exposed_spelling="uint64_t",
-                    kind=MappedKind.OPAQUE_HANDLE,
-                    to_native_expr=f"OpaqueHandleRegistry<{base_norm}>::get({{var}})",
-                    notes=f"Opaque handle -> pointer mapping for {base_norm}* (requires runtime registry)",
-                )
+            # opaque handles disabled: fall through to unsupported
             return MappedType(
                 native_spelling=_strip_cv_and_class_kw(t.spelling),
                 exposed_spelling="<unsupported>",
@@ -716,16 +706,14 @@ class TypeMapper:
         if self.config.enable_std_string and _is_std_string(t.spelling):
             return self._string_return_mapping_std_string(t)
 
-        # OCCT handle<T> return mapping -> opaque handle (uint64_t)
+        # OCCT handle<T> return mapping disabled in simplified mode
         handle_type = _match_occt_handle_type(t.spelling)
         if handle_type:
             return MappedType(
                 native_spelling=_strip_cv_and_class_kw(t.spelling),
-                exposed_spelling="uint64_t",
-                kind=MappedKind.OPAQUE_HANDLE,
-                from_native_expr=f"OpaqueHandleRegistry<{handle_type}>::put(new {handle_type}({{expr}}))",
-                default_exposed_value="0",
-                notes=f"OCCT handle return mapped to opaque handle (registry of {handle_type})",
+                exposed_spelling="<unsupported>",
+                kind=MappedKind.UNSUPPORTED,
+                notes="OCCT handle<T> return not supported in simplified mode",
             )
 
         # void* return mapping -> intptr_t exposed
@@ -761,8 +749,8 @@ class TypeMapper:
             wrapper = self.known_wrapped[base_abs]
             return self._wrapped_return_mapping_ptr(t, base_abs, wrapper)
 
-        # Unknown pointer return -> opaque handle if enabled (but avoid primitives)
-        if t.is_pointer and self.config.enable_opaque_handles:
+        # Unknown pointer return -> unsupported (except primitive pointers mapped to intptr_t)
+        if t.is_pointer:
             if _is_pointer_to_primitive(t):
                 return MappedType(
                     native_spelling=_strip_cv_and_class_kw(t.spelling),
@@ -770,9 +758,14 @@ class TypeMapper:
                     kind=MappedKind.PRIMITIVE,
                     from_native_expr="reinterpret_cast<intptr_t>({expr})",
                     default_exposed_value="0",
-                    notes="Pointer to primitive mapped to intptr_t (no opaque handle needed)",
+                    notes="Pointer to primitive mapped to intptr_t (opaque handles disabled)",
                 )
-            return self._opaque_handle_return_mapping_ptr(t)
+            return MappedType(
+                native_spelling=_strip_cv_and_class_kw(t.spelling),
+                exposed_spelling="<unsupported>",
+                kind=MappedKind.UNSUPPORTED,
+                notes="Pointer return to unknown type is not supported in simplified mode",
+            )
 
         # Unknown reference or value class return: not supported (copy/ownership unclear)
         if t.is_reference or ("::" in base and not t.is_pointer):

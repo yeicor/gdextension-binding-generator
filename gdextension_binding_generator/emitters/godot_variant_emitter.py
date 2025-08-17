@@ -79,8 +79,6 @@ class GodotVariantEmitter:
         self.renderer = renderer
         self.config = config or VariantEmitterConfig()
         self._mapper = mapper  # Can be None; if so, built in emit()
-        # Emit opaque_handle_registry.h only once per run when needed.
-        self._opaque_emitted = False
 
     # ---- Public API ----
 
@@ -232,24 +230,7 @@ class GodotVariantEmitter:
         header_text = self.renderer.render("variant_class_header.h.j2", context)
         source_text = self.renderer.render("variant_class_source.cpp.j2", context)
 
-        # If any mapped methods use opaque handles, ensure registry header exists (once)
-        handles_used = uses_opaque_handles(mapped_instance, mapped_static)
-        if handles_used and not self._opaque_emitted:
-            try:
-                registry_hdr = self.renderer.render("opaque_handle_registry.h.j2", {})
-                write_text(self.ctx.classes_dir / "opaque_handle_registry.h", registry_hdr, dry_run=self.ctx.dry_run)
-                self._opaque_emitted = True
-            except Exception:
-                logger.exception("Failed to render/write opaque_handle_registry.h; continuing")
 
-        # If handles are used in this class, include the registry header from the generated source
-        if handles_used:
-            marker = f'#include "{ci.wrapper_name}.h"'
-            include_line = marker + '\n#include "opaque_handle_registry.h"'
-            if marker in source_text:
-                source_text = source_text.replace(marker, include_line, 1)
-            else:
-                source_text = '#include "opaque_handle_registry.h"\n' + source_text
 
         write_text(self.ctx.classes_dir / f"{ci.wrapper_name}.h", header_text, dry_run=self.ctx.dry_run)
         write_text(self.ctx.classes_dir / f"{ci.wrapper_name}.cpp", source_text, dry_run=self.ctx.dry_run)
