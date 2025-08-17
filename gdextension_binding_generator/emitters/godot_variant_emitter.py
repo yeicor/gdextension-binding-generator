@@ -79,6 +79,8 @@ class GodotVariantEmitter:
         self.renderer = renderer
         self.config = config or VariantEmitterConfig()
         self._mapper = mapper  # Can be None; if so, built in emit()
+        # Emit opaque_handle_registry.h only once per run when needed.
+        self._opaque_emitted = False
 
     # ---- Public API ----
 
@@ -148,16 +150,106 @@ class GodotVariantEmitter:
             logger.info("No supported methods for %s; skipping wrapper generation", ci.qualified_name)
             return
 
-        header_text = self._render_header(ci, mapped_instance, mapped_static, mapped_ctors)
-        source_text = self._render_source(ci, mapped_instance, mapped_static, mapped_ctors)
+        # Build variant mapping structure for templates
+        variant = {
+            "constructors": [],
+            "instance_methods": [],
+            "static_methods": [],
+        }
+        # Constructors (mapped)
+        for ctor, params_sig, pre_lines, arg_exprs, _ in mapped_ctors:
+            suffix = f"_{ctor.overload_index}" if ctor.overload_index is not None and ctor.overload_index > 0 else ""
+            variant["constructors"].append({
+                "name": ctor.name,
+                "suffix": suffix,
+                "params": [{"type": t, "name": n} for (t, n) in params_sig],
+                "pre_lines": list(pre_lines),
+                "call_args": list(arg_exprs),
+                "return_type": "bool",
+                "call_expr": None,
+                "native_name": ctor.name,
+                "return_transform": None,
+                "default_return": "false",
+            })
+        # Instance methods (mapped)
+        for mm in mapped_instance:
+            # Build sanitized params and conversion/call data
+            san_params = []
+            pre_lines = []
+            call_args = []
+            for (ptype, pname), mp in zip(mm.exposed_param_list, mm.exposed_params):
+                sname = sanitize_identifier(pname)
+                san_params.append({"type": ptype, "name": sname})
+                for pl in mp.mapping.pre_call_lines:
+                    pre_lines.append(pl.replace("{var}", sname))
+                if mp.mapping.to_native_expr:
+                    call_args.append(mp.mapping.to_native_expr.replace("{var}", sname))
+                else:
+                    call_args.append(sname)
+            ret_pre = list(mm.exposed_return.mapping.pre_call_lines)
+            variant["instance_methods"].append({
+                "name": mm.method_name,
+                "native_name": mm.method_name,
+                "exposed_name": mm.exposed_name,
+                "return_type": mm.exposed_return.mapping.exposed_spelling,
+                "params": san_params,
+                "is_const": mm.is_const,
+                "pre_lines": pre_lines + ret_pre,
+                "call_args": call_args,
+                "return_transform": mm.exposed_return.mapping.from_native_expr or None,
+                "default_return": mm.default_return_expr,
+                "call_expr": None,
+            })
+        # Static methods (mapped)
+        for mm in mapped_static:
+            # Build sanitized params and conversion/call data
+            san_params = []
+            pre_lines = []
+            call_args = []
+            for (ptype, pname), mp in zip(mm.exposed_param_list, mm.exposed_params):
+                sname = sanitize_identifier(pname)
+                san_params.append({"type": ptype, "name": sname})
+                for pl in mp.mapping.pre_call_lines:
+                    pre_lines.append(pl.replace("{var}", sname))
+                if mp.mapping.to_native_expr:
+                    call_args.append(mp.mapping.to_native_expr.replace("{var}", sname))
+                else:
+                    call_args.append(sname)
+            ret_pre = list(mm.exposed_return.mapping.pre_call_lines)
+            variant["static_methods"].append({
+                "name": mm.method_name,
+                "native_name": mm.method_name,
+                "exposed_name": mm.exposed_name,
+                "return_type": mm.exposed_return.mapping.exposed_spelling,
+                "params": san_params,
+                "pre_lines": pre_lines + ret_pre,
+                "call_args": call_args,
+                "return_transform": mm.exposed_return.mapping.from_native_expr or None,
+                "call_expr": None,
+            })
 
-        # If any mapped methods use opaque handles, emit the registry header alongside classes
-        if uses_opaque_handles(mapped_instance, mapped_static):
+        context = {"cls": ci.to_dict(), "prefix": self.ctx.prefix, "variant": variant}
+        header_text = self.renderer.render("variant_class_header.h.j2", context)
+        source_text = self.renderer.render("variant_class_source.cpp.j2", context)
+
+        # If any mapped methods use opaque handles, ensure registry header exists (once)
+        handles_used = uses_opaque_handles(mapped_instance, mapped_static)
+        if handles_used and not self._opaque_emitted:
             try:
                 registry_hdr = self.renderer.render("opaque_handle_registry.h.j2", {})
                 write_text(self.ctx.classes_dir / "opaque_handle_registry.h", registry_hdr, dry_run=self.ctx.dry_run)
+                self._opaque_emitted = True
             except Exception:
                 logger.exception("Failed to render/write opaque_handle_registry.h; continuing")
+
+        # If handles are used in this class, include the registry header from the generated source
+        if handles_used:
+            marker = f'#include "{ci.wrapper_name}.h"'
+            include_line = marker + '\n#include "opaque_handle_registry.h"'
+            if marker in source_text:
+                source_text = source_text.replace(marker, include_line, 1)
+            else:
+                source_text = '#include "opaque_handle_registry.h"\n' + source_text
 
         write_text(self.ctx.classes_dir / f"{ci.wrapper_name}.h", header_text, dry_run=self.ctx.dry_run)
         write_text(self.ctx.classes_dir / f"{ci.wrapper_name}.cpp", source_text, dry_run=self.ctx.dry_run)
@@ -184,333 +276,27 @@ class GodotVariantEmitter:
 
         for i, p in enumerate(m.parameters, start=1):
             pname = p.name or f"arg{i}"
+            sname = sanitize_identifier(pname)
             mp = mapper._map_parameter(p.cpp_type, pname)  # Using internal mapping for parameters
             if mp.kind == MappedKind.UNSUPPORTED:
                 return None, [], [], []
-            params_sig.append((mp.exposed_spelling, pname))
+            params_sig.append((mp.exposed_spelling, sname))
 
-            # Pre-call conversions
+            # Pre-call conversions (use sanitized name)
             for line in mp.pre_call_lines:
-                pre_lines.append(line.replace("{var}", pname))
+                pre_lines.append(line.replace("{var}", sname))
 
-            # Native argument expression
+            # Native argument expression (use sanitized name)
             if mp.to_native_expr:
-                arg_exprs.append(mp.to_native_expr.replace("{var}", pname))
+                arg_exprs.append(mp.to_native_expr.replace("{var}", sname))
             else:
-                arg_exprs.append(pname)
+                arg_exprs.append(sname)
 
-            d_method_args.append(sanitize_identifier(pname))
+            d_method_args.append(sname)
 
         return params_sig, pre_lines, arg_exprs, d_method_args
 
-    # ---- Code rendering ----
-
-    def _render_header(
-        self,
-        ci: ClassInfo,
-        instance_methods: List[MappedMethod],
-        static_methods: List[MappedMethod],
-        mapped_ctors: List[Tuple[MethodInfo, List[Tuple[str, str]], List[str], List[str], List[str]]],
-    ) -> str:
-        """
-        Generate the header content for a class using mapped signatures.
-        """
-        lines: List[str] = []
-        lines.append("#pragma once")
-        lines.append("/**")
-        lines.append(" * This file is generated by the GDExtension binding generator (Variant-aware).")
-        lines.append(" *")
-        lines.append(f" * Wrapper: {ci.wrapper_name}")
-        lines.append(f" * Native : {ci.qualified_name}")
-        lines.append(" */")
-        lines.append("")
-        lines.append("#include <godot_cpp/classes/ref_counted.hpp>")
-        lines.append("#include <godot_cpp/core/class_db.hpp>")
-        # Include for opaque handles if used
-        if uses_opaque_handles(instance_methods, static_methods):
-            lines.append("#include <cstdint>")
-        lines.append("")
-        lines.append(f"// Include the native library header that defines {ci.qualified_name}.")
-        lines.append(f"#include <{ci.include_header}>")
-        lines.append("")
-
-        # Collect forward declarations for wrapper types used as Ref<Wrapper>
-        fwd_wrappers = collect_forward_decl_wrappers(instance_methods, static_methods)
-        lines.append("namespace godot {")
-        lines.append("")
-        for w in sorted(fwd_wrappers):
-            # Avoid forward declaring self
-            if w != ci.wrapper_name:
-                lines.append(f"class {w};")
-        if fwd_wrappers:
-            lines.append("")
-
-        lines.append(f"class {ci.wrapper_name} : public RefCounted {{")
-        lines.append(f"    GDCLASS({ci.wrapper_name}, RefCounted)")
-        lines.append("")
-        lines.append("  private:")
-        lines.append("    // NOTE: Adjust ownership/lifetime as needed for your library.")
-        lines.append("    // This skeleton uses a raw pointer; consider smart pointers or handles.")
-        abs_q = f"::{ci.qualified_name}" if not ci.qualified_name.startswith('::') else ci.qualified_name
-        lines.append(f"    {abs_q}* impl = nullptr;")
-        lines.append("    bool owns_impl = true;")
-        lines.append("")
-        lines.append("  protected:")
-        lines.append("    static void _bind_methods();")
-        lines.append("")
-        lines.append("  public:")
-        lines.append(f"    {ci.wrapper_name}();")
-        lines.append(f"    ~{ci.wrapper_name}();")
-        lines.append("")
-        lines.append("    // Helper API")
-        lines.append("    bool is_valid() const;")
-        lines.append("")
-        lines.append("    // Ownership and impl management")
-        lines.append("    void reset();")
-        lines.append(f"    void set_impl({abs_q}* p, bool p_take_ownership = false);")
-        lines.append(f"    {abs_q}* get_impl() const;")
-        lines.append("    void set_owns_impl(bool p_own);")
-        lines.append("    bool get_owns_impl() const;")
-        lines.append("")
-
-        # Constructors wrappers
-        if mapped_ctors:
-            lines.append("    // Construct the underlying native object using discovered constructors")
-            for ctor, params_sig, _, _, _ in mapped_ctors:
-                suffix = f"_{ctor.overload_index}" if ctor.overload_index is not None and ctor.overload_index > 0 else ""
-                params_text = ", ".join(f"{t} {n}" for t, n in params_sig)
-                lines.append(f"    // {ctor.cpp_signature}")
-                lines.append(f"    bool construct{suffix}({params_text});")
-            lines.append("")
-
-        # Instance methods
-        if instance_methods:
-            lines.append("    // Discovered instance methods (Variant-compatible)")
-            for mm in instance_methods:
-                params_text = ", ".join(f"{t} {n}" for t, n in mm.exposed_param_list)
-                const_q = " const" if mm.is_const else ""
-                lines.append(f"    // native: {mm.method_name}")
-                lines.append(f"    {mm.exposed_return.mapping.exposed_spelling} {mm.exposed_name}({params_text}){const_q};")
-            lines.append("")
-
-        # Static methods
-        if static_methods:
-            lines.append("    // Discovered static methods (Variant-compatible)")
-            for mm in static_methods:
-                params_text = ", ".join(f"{t} {n}" for t, n in mm.exposed_param_list)
-                lines.append(f"    // native static: {mm.method_name}")
-                lines.append(f"    static {mm.exposed_return.mapping.exposed_spelling} {mm.exposed_name}({params_text});")
-            lines.append("")
-
-        lines.append("};")
-        lines.append("")
-        lines.append("} // namespace godot")
-        lines.append("")
-        return "\n".join(lines)
-
-    def _render_source(
-        self,
-        ci: ClassInfo,
-        instance_methods: List[MappedMethod],
-        static_methods: List[MappedMethod],
-        mapped_ctors: List[Tuple[MethodInfo, List[Tuple[str, str]], List[str], List[str], List[str]]],
-    ) -> str:
-        """
-        Generate the source content for a class with mapped method implementations.
-        """
-        lines: List[str] = []
-        lines.append("/**")
-        lines.append(" * This file is generated by the GDExtension binding generator (Variant-aware).")
-        lines.append(" *")
-        lines.append(f" * Native : {ci.qualified_name}")
-        lines.append(f" * Wrapper: {ci.wrapper_name}")
-        lines.append(" */")
-        lines.append("")
-        lines.append(f'#include "{ci.wrapper_name}.h"')
-        if uses_opaque_handles(instance_methods, static_methods):
-            lines.append('#include "opaque_handle_registry.h"')
-        lines.append("")
-        lines.append("using namespace godot;")
-        lines.append("")
-        lines.append(f"void {ci.wrapper_name}::_bind_methods() {{")
-        lines.append("    // Helper methods")
-        lines.append(f"    ClassDB::bind_method(D_METHOD(\"is_valid\"), &{ci.wrapper_name}::is_valid);")
-        lines.append(f"    ClassDB::bind_method(D_METHOD(\"reset\"), &{ci.wrapper_name}::reset);")
-        lines.append(f"    ClassDB::bind_method(D_METHOD(\"set_owns_impl\", \"own\"), &{ci.wrapper_name}::set_owns_impl);")
-        lines.append(f"    ClassDB::bind_method(D_METHOD(\"get_owns_impl\"), &{ci.wrapper_name}::get_owns_impl);")
-        lines.append("")
-        # Constructor bindings
-        for ctor, _, _, _, d_method_args in mapped_ctors:
-            suffix = f"_{ctor.overload_index}" if ctor.overload_index is not None and ctor.overload_index > 0 else ""
-            args_list = ", ".join([f"\"{a}\"" for a in d_method_args])
-            if args_list:
-                lines.append(f"    ClassDB::bind_method(D_METHOD(\"construct{suffix}\", {args_list}), &{ci.wrapper_name}::construct{suffix});")
-            else:
-                lines.append(f"    ClassDB::bind_method(D_METHOD(\"construct{suffix}\"), &{ci.wrapper_name}::construct{suffix});")
-        if mapped_ctors:
-            lines.append("")
-        # Instance methods
-        for mm in instance_methods:
-            args_list = ", ".join([f"\"{sanitize_identifier(n)}\"" for _, n in mm.exposed_param_list])
-            if args_list:
-                lines.append(f"    ClassDB::bind_method(D_METHOD(\"{mm.exposed_name}\", {args_list}), &{ci.wrapper_name}::{mm.exposed_name});")
-            else:
-                lines.append(f"    ClassDB::bind_method(D_METHOD(\"{mm.exposed_name}\"), &{ci.wrapper_name}::{mm.exposed_name});")
-        if instance_methods:
-            lines.append("")
-        # Static methods
-        for mm in static_methods:
-            args_list = ", ".join([f"\"{sanitize_identifier(n)}\"" for _, n in mm.exposed_param_list])
-            if args_list:
-                lines.append(f"    ClassDB::bind_static_method({ci.wrapper_name}::get_class_static(), D_METHOD(\"{mm.exposed_name}\", {args_list}), &{ci.wrapper_name}::{mm.exposed_name});")
-            else:
-                lines.append(f"    ClassDB::bind_static_method({ci.wrapper_name}::get_class_static(), D_METHOD(\"{mm.exposed_name}\"), &{ci.wrapper_name}::{mm.exposed_name});")
-        lines.append("}")
-        lines.append("")
-
-        # Helper/ownership implementations
-        abs_q = f"::{ci.qualified_name}" if not ci.qualified_name.startswith('::') else ci.qualified_name
-
-        lines.append(f"bool {ci.wrapper_name}::is_valid() const {{")
-        lines.append("    return impl != nullptr;")
-        lines.append("}")
-        lines.append("")
-        lines.append(f"void {ci.wrapper_name}::reset() {{")
-        lines.append("    if (impl && owns_impl) {")
-        lines.append("        delete impl;")
-        lines.append("    }")
-        lines.append("    impl = nullptr;")
-        lines.append("}")
-        lines.append("")
-        lines.append(f"void {ci.wrapper_name}::set_impl({abs_q}* p, bool p_take_ownership) {{")
-        lines.append("    if (impl && owns_impl) {")
-        lines.append("        delete impl;")
-        lines.append("    }")
-        lines.append("    impl = p;")
-        lines.append("    owns_impl = p_take_ownership;")
-        lines.append("}")
-        lines.append("")
-        lines.append(f"{abs_q}* {ci.wrapper_name}::get_impl() const {{")
-        lines.append("    return impl;")
-        lines.append("}")
-        lines.append("")
-        lines.append(f"void {ci.wrapper_name}::set_owns_impl(bool p_own) {{")
-        lines.append("    owns_impl = p_own;")
-        lines.append("}")
-        lines.append("")
-        lines.append(f"bool {ci.wrapper_name}::get_owns_impl() const {{")
-        lines.append("    return owns_impl;")
-        lines.append("}")
-        lines.append("")
-
-        # Constructor wrappers
-        for ctor, params_sig, pre_lines, arg_exprs, _ in mapped_ctors:
-            suffix = f"_{ctor.overload_index}" if ctor.overload_index is not None and ctor.overload_index > 0 else ""
-            params_text = ", ".join(f"{t} {n}" for t, n in params_sig)
-            lines.append(f"// {ctor.cpp_signature}")
-            lines.append(f"bool {ci.wrapper_name}::construct{suffix}({params_text}) {{")
-            lines.append("    if (impl && owns_impl) {")
-            lines.append("        delete impl;")
-            lines.append("    }")
-            # Pre-call lines
-            for pl in pre_lines:
-                lines.append(f"    {pl}")
-            call_args = ", ".join(arg_exprs)
-            lines.append(f"    impl = new {abs_q}({call_args});")
-            lines.append("    return impl != nullptr;")
-            lines.append("}")
-            lines.append("")
-
-        # Instance methods
-        for mm in instance_methods:
-            params_text = ", ".join(f"{t} {n}" for t, n in mm.exposed_param_list)
-            const_q = " const" if mm.is_const else ""
-            lines.append(f"// native: {mm.method_name}")
-            lines.append(f"{mm.exposed_return.mapping.exposed_spelling} {ci.wrapper_name}::{mm.exposed_name}({params_text}){const_q} {{")
-            # Impl check
-            if mm.has_return:
-                default_expr = mm.default_return_expr or "{}"
-                lines.append("    if (!impl) {")
-                lines.append(f"        return {default_expr};")
-                lines.append("    }")
-            else:
-                lines.append("    if (!impl) {")
-                lines.append("        return;")
-                lines.append("    }")
-            # Pre-call conversions per parameter (recompute to replace placeholders safely)
-            param_pre_lines, native_args = build_param_call_data(mm.exposed_params)
-            for pl in param_pre_lines:
-                lines.append(f"    {pl}")
-            # Return pre-call lines if any
-            for pl in mm.exposed_return.mapping.pre_call_lines:
-                lines.append(f"    {pl}")
-            call_expr = f"impl->{mm.method_name}({', '.join(native_args)})"
-            # Return or void handling
-            ret_map = mm.exposed_return.mapping
-            if ret_map.kind == MappedKind.VOID:
-                lines.append(f"    {call_expr};")
-            else:
-                if ret_map.from_native_expr:
-                    if ret_map.from_native_expr.lstrip().startswith("{"):
-                        # Full block form; substitute {expr}
-                        block = ret_map.from_native_expr.replace("{expr}", call_expr)
-                        for ln in block.splitlines():
-                            lines.append(f"    {ln}")
-                    else:
-                        expr = ret_map.from_native_expr.replace("{expr}", call_expr)
-                        lines.append(f"    return {expr};")
-                else:
-                    lines.append(f"    return {call_expr};")
-            lines.append("}")
-            lines.append("")
-
-        # Static methods
-        for mm in static_methods:
-            params_text = ", ".join(f"{t} {n}" for t, n in mm.exposed_param_list)
-            lines.append(f"// native static: {mm.method_name}")
-            lines.append(f"{mm.exposed_return.mapping.exposed_spelling} {ci.wrapper_name}::{mm.exposed_name}({params_text}) {{")
-            # Pre-call conversions per parameter
-            param_pre_lines, native_args = build_param_call_data(mm.exposed_params)
-            for pl in param_pre_lines:
-                lines.append(f"    {pl}")
-            for pl in mm.exposed_return.mapping.pre_call_lines:
-                lines.append(f"    {pl}")
-            call_expr = f"{abs_q}::{mm.method_name}({', '.join(native_args)})"
-            ret_map = mm.exposed_return.mapping
-            if ret_map.kind == MappedKind.VOID:
-                lines.append(f"    {call_expr};")
-            else:
-                if ret_map.from_native_expr:
-                    if ret_map.from_native_expr.lstrip().startswith("{"):
-                        block = ret_map.from_native_expr.replace("{expr}", call_expr)
-                        for ln in block.splitlines():
-                            lines.append(f"    {ln}")
-                    else:
-                        expr = ret_map.from_native_expr.replace("{expr}", call_expr)
-                        lines.append(f"    return {expr};")
-                else:
-                    lines.append(f"    return {call_expr};")
-            lines.append("}")
-            lines.append("")
-
-        # Ctors/dtor
-        lines.append(f"{ci.wrapper_name}::{ci.wrapper_name}() {{")
-        lines.append("    // Do not auto-construct; use construct(...) wrappers to initialize impl.")
-        lines.append("    impl = nullptr;")
-        lines.append("    owns_impl = true;")
-        lines.append("}")
-        lines.append("")
-        lines.append(f"{ci.wrapper_name}::~{ci.wrapper_name}() {{")
-        lines.append("    if (impl && owns_impl) {")
-        lines.append("        delete impl;")
-        lines.append("    }")
-        lines.append("    impl = nullptr;")
-        lines.append("}")
-        lines.append("")
-
-        return "\n".join(lines)
-
-    # ---- Utilities ----
+# ---- Utilities ----
 
 def collect_forward_decl_wrappers(
     instance_methods: List[MappedMethod],

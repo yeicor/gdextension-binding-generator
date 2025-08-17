@@ -157,12 +157,20 @@ def _qualified_name_from_cursor(decl: Any) -> str:
 
 def _fully_qualified_type_spelling(tp: Any) -> str:
     """
-    Replace the base identifier in a type spelling with its fully qualified name
-    (including namespaces and enclosing classes), preserving qualifiers like const, *, &.
+    Return a canonicalized type spelling that resolves typedefs (e.g., Standard_Address -> void*)
+    and preserves pointer/reference/const qualifiers by leveraging Clang's canonical type.
     """
-    spelling = getattr(tp, "spelling", None) or "void"
     try:
-        decl = getattr(tp, "get_declaration", lambda: None)()
+        get_canon = getattr(tp, "get_canonical", None)
+        ct = get_canon() if callable(get_canon) else getattr(tp, "canonical", None)
+        base = ct or tp
+        spelling = getattr(base, "spelling", None) or "void"
+        return spelling
+    except Exception:
+        base = tp
+    spelling = getattr(base, "spelling", None) or "void"
+    try:
+        decl = getattr(base, "get_declaration", lambda: None)()
     except Exception:
         decl = None
     if decl is not None and getattr(decl, "spelling", None):
@@ -379,6 +387,19 @@ def _collect_class_decls(
                 if not node.spelling:  # anonymous
                     logger.warning("Skipping anonymous class/struct declaration")
                     return
+
+                # Skip non-public nested classes/structs (e.g., private nested helpers)
+                try:
+                    parent = getattr(node, "semantic_parent", None)
+                    parent_kind = getattr(getattr(parent, "kind", None), "name", "")
+                    is_nested = parent_kind in ("CLASS_DECL", "STRUCT_DECL", "CLASS_TEMPLATE")
+                    acc = getattr(node, "access_specifier", None)  # may be None
+                    acc_name = getattr(acc, "name", "NONE")
+                    if is_nested and acc_name != "PUBLIC":
+                        logger.info("Skipping non-public nested %s '%s' (access=%s)", kind_name.lower(), node.spelling or "<unnamed>", acc_name)
+                        return
+                except Exception as e:
+                    logger.warning("Failed to determine access specifier for node '%s'; including it; error: %s", getattr(node, "spelling", None) or "<unnamed>", e)
 
                 usr = ""
                 try:

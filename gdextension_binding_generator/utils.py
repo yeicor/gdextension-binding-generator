@@ -154,6 +154,157 @@ except Exception:
 # Jinja environment helpers
 # ----------------------------------------
 
+
+# --------------------------
+# Utilities
+# --------------------------
+
+_GODOT_RESERVED_IDENTIFIERS = {
+    # Common C++/C/GDScript/godot-cpp sensitive identifiers to avoid exposing verbatim.
+    "class",
+    "enum",
+    "struct",
+    "union",
+    "template",
+    "operator",
+    "signal",
+    "var",
+    "const",
+    "static",
+    "void",
+    "int",
+    "float",
+    "bool",
+    "true",
+    "false",
+    "self",
+    "super",
+    "_init",
+    "_ready",
+    "_process",
+    "_physics_process",
+    # Additional C++ keywords that can appear as method names; disambiguate by suffixing underscore.
+    "throw",
+}
+
+def camel_to_snake(name: str) -> str:
+    """
+    Convert CamelCase or mixedCase to snake_case, leaving existing underscores intact.
+    """
+    out: List[str] = []
+    prev_lower = False
+    prev_char = ""
+    for ch in name:
+        if ch.isupper() and (prev_lower or (prev_char and prev_char.isalpha() and prev_char != "_")):
+            out.append("_")
+        out.append(ch.lower())
+        prev_lower = ch.islower()
+        prev_char = ch
+    return "".join(out)
+
+def sanitize_identifier(name: str) -> str:
+    """
+    Sanitize an identifier for exposure to Godot/C++:
+    - Convert to snake_case by convention.
+    - Replace non [A-Za-z0-9_] characters with underscores.
+    - Ensure it does not start with a digit (prefix with underscore if needed).
+    - If it collides with a reserved identifier, append a trailing underscore.
+    """
+    snake = camel_to_snake(name or "")
+
+    # Replace non-word characters with underscores
+    cleaned_chars: List[str] = []
+    for ch in snake:
+        if ch.isalnum() or ch == "_":
+            cleaned_chars.append(ch)
+        else:
+            cleaned_chars.append("_")
+    ident = "".join(cleaned_chars)
+
+    # Ensure non-empty identifier
+    if not ident:
+        ident = "_"
+
+    # Ensure it does not start with a digit
+    if ident[0].isdigit():
+        ident = f"_{ident}"
+
+    # Avoid reserved identifiers
+    if ident in _GODOT_RESERVED_IDENTIFIERS:
+        return f"{ident}_"
+    return ident
+
+def stable_signature_hash(text: str) -> str:
+    """
+    Produce a short, stable hash for disambiguation (deterministic, no randomness).
+    We avoid external deps; use a simple FNV-1a 32-bit variant and encode as base36.
+    """
+    fnv_prime = 0x01000193
+    hash_val = 0x811C9DC5
+    for b in text.encode("utf-8"):
+        hash_val ^= b
+        hash_val = (hash_val * fnv_prime) & 0xFFFFFFFF
+    # base36
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if hash_val == 0:
+        return "0"
+    chars = []
+    v = hash_val
+    while v > 0:
+        v, rem = divmod(v, 36)
+        chars.append(alphabet[rem])
+    return "".join(reversed(chars))
+
+
+def sanitize_identifier(name: str) -> str:
+    """
+    Sanitize an identifier for exposure to C++/Godot:
+    - Convert to snake_case (consistent with templates).
+    - Replace non [A-Za-z0-9_] characters with underscores.
+    - Ensure it does not start with a digit (prefix with underscore if needed).
+    - If it collides with a reserved identifier or C++ keyword, append a trailing underscore.
+    """
+    # Start from raw name; avoid calling any external sanitizer to prevent recursion
+    plain = name or "identifier"
+
+    # Normalize to snake_case using the project's function if available
+    try:
+        snake = camel_to_snake(plain)
+    except Exception:
+        snake = plain
+
+    cleaned_chars = []
+    for ch in snake:
+        if ch.isalnum() or ch == "_":
+            cleaned_chars.append(ch)
+        else:
+            cleaned_chars.append("_")
+    ident = "".join(cleaned_chars) or "_"
+
+    if ident[0].isdigit():
+        ident = f"_{ident}"
+
+    # C++ and Godot-sensitive reserved words that must not be used verbatim
+    cpp_reserved = [
+        # C++ keywords and common builtins
+        "alignas","alignof","and","and_eq","asm","auto","bitand","bitor","bool","break","case",
+        "catch","char","char8_t","char16_t","char32_t","class","compl","const","consteval",
+        "constexpr","constinit","const_cast","continue","co_await","co_return","co_yield",
+        "decltype","default","delete","do","double","dynamic_cast","else","enum","explicit",
+        "export","extern","false","float","for","friend","goto","if","inline","int","long",
+        "mutable","namespace","new","noexcept","not","not_eq","nullptr","operator","or","or_eq",
+        "private","protected","public","register","reinterpret_cast","return","short","signed",
+        "sizeof","static","static_assert","static_cast","struct","switch","template","this",
+        "thread_local","throw","true","try","typedef","typeid","typename","union","unsigned",
+        "using","virtual","void","volatile","wchar_t","while","xor","xor_eq",
+        # Common godot/c++ identifiers we avoid exposing
+        "signal","var","self","super","_init","_ready","_process","_physics_process",
+    ] + list(_GODOT_RESERVED_IDENTIFIERS)
+
+    if ident in cpp_reserved:
+        ident = f"{ident}_"
+    return ident
+
 class TemplateRenderer:
     """
     A thin wrapper over a Jinja2 Environment with layered loaders and useful filters.
@@ -203,6 +354,7 @@ class TemplateRenderer:
 
     def _register_filters(self) -> None:
         self.env.filters["to_snake"] = camel_to_snake
+        # Use C++-aware sanitizer to avoid reserved/keyword collisions like 'this' and 'delete'
         self.env.filters["sanitize"] = sanitize_identifier
         self.env.filters["cpp_param_list"] = _filter_cpp_param_list
         self.env.filters["d_method_args"] = _filter_d_method_args
@@ -412,4 +564,6 @@ __all__ = [
     "normalize_newlines",
     "atomic_write_text",
     "write_text",
+    # Export sanitizers for direct imports
+    "sanitize_identifier",
 ]

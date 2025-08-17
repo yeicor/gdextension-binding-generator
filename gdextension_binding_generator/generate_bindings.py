@@ -4,7 +4,8 @@ GDExtension C++ binding generator (production-ready, modular)
 
 This entrypoint wires together:
 - Parsing (libclang-based) to discover classes and detailed method info
-- Emitting (Jinja2-based) to generate Godot 4.4 GDExtension wrapper sources
+- Emitting (Jinja2-based) standard emitter (full surface)
+- Variant-aware emitter (Variant-only API: scalars, String bridging, wrapped-class bridging, optional opaque handles)
 
 Outputs:
 - <output_dir>/register_types.h
@@ -21,9 +22,22 @@ Usage (example):
     --clang-args "-Ipath/to/opencascade/include -std=c++17" \
     --output-dir src/generated
 
+Variant-only example:
+  python -m gdextension_binding_generator.generate_bindings \
+    --variant-api \
+    --prefix OCC_ \
+    --headers path/to/opencascade/include \
+    --clang-args "-Ipath/to/opencascade/include -std=c++17" \
+    --output-dir src/generated
+
 Notes:
 - You need libclang and Jinja2 installed in your Python environment.
 - For libclang discovery issues, ensure your environment can locate the libclang shared library.
+- Typedefs are resolved to canonical clang types for mapping (e.g., Standard_Address -> void*), and void* is exposed as intptr_t in Variant APIs.
+- Variant emitter flags:
+  - --variant-api: enable Variant-only emission
+  - --no-opaque-handles: disable mapping unknown pointer types to uint64_t handles
+  - --no-std-string: disable std::string <-> godot::String mapping
 """
 
 from __future__ import annotations
@@ -43,7 +57,6 @@ from .models import GenerationContext
 from .utils import TemplateRenderer, configure_logging
 from .manifest import emit_manifest
 from .parsing.clang_parser import collect_classes_from_headers
-from .emitters.godot_emitter import GodotEmitter, EmitterConfig
 from .emitters.godot_variant_emitter import GodotVariantEmitter, VariantEmitterConfig
 from .type_mapping import MappingConfig, TypeMapper
 
@@ -170,11 +183,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Optional file to write logs to."
     )
     # Variant-aware emitter options
-    p.add_argument(
-        "--variant-api",
-        action="store_true",
-        help="Use Variant-aware emitter: only expose methods with Variant-compatible types and conversions."
-    )
+
     p.add_argument(
         "--no-opaque-handles",
         action="store_true",
@@ -276,30 +285,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("Dry-run complete (no files written).")
         return 0
 
-    # Emit sources
+    # Emit sources (Variant-only emitter)
     try:
-        if getattr(ns, "variant_api", False):
-            # Configure TypeMapper based on CLI
-            cfg = MappingConfig(
-                prefix=ctx.prefix,
-                enable_opaque_handles=not getattr(ns, "no_opaque_handles", False),
-                use_wrapped_param_bridge=True,
-                enable_std_string=not getattr(ns, "no_std_string", False),
-            )
-            mapper = TypeMapper.from_classes(classes, config=cfg)
-            ve_cfg = VariantEmitterConfig()
-            emitter = GodotVariantEmitter(
-                ctx=ctx,
-                renderer=renderer,
-                config=ve_cfg,
-                mapper=mapper,
-            )
-        else:
-            emitter = GodotEmitter(
-                ctx=ctx,
-                renderer=renderer,
-                config=EmitterConfig(),
-            )
+        cfg = MappingConfig(
+            prefix=ctx.prefix,
+            enable_opaque_handles=not getattr(ns, "no_opaque_handles", False),
+            use_wrapped_param_bridge=True,
+            enable_std_string=not getattr(ns, "no_std_string", False),
+        )
+        mapper = TypeMapper.from_classes(classes, config=cfg)
+        ve_cfg = VariantEmitterConfig()
+        emitter = GodotVariantEmitter(
+            ctx=ctx,
+            renderer=renderer,
+            config=ve_cfg,
+            mapper=mapper,
+        )
         emitter.emit(classes)
     except Exception:
         logger.exception("Failed to generate files")

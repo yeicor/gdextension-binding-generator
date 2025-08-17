@@ -44,6 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Sequence, Tuple
+import re
 
 from .models import ClassInfo, MethodInfo, MethodKind, CppType
 
@@ -76,15 +77,22 @@ def _strip_cv_and_class_kw(spelling: str) -> str:
 
 def _base_identifier(spelling: str) -> str:
     """
-    Extract a best-effort "base identifier" for a type spelling, ignoring pointers/references.
+    Extract a best-effort "base identifier" for a type spelling, ignoring pointers/references and CV (const/volatile).
     Example:
       'const opencascade::TopAbs_Shape*&' -> 'opencascade::TopAbs_Shape'
       'const char*' -> 'char'
+      'char const*' -> 'char'
       'std::basic_string<char>' -> 'std::basic_string<char>'
     """
     s = _strip_cv_and_class_kw(spelling)
-    # Remove pointer/reference suffixes
-    s = s.replace("&", "").replace("*", "").strip()
+    # Remove pointer/reference markers
+    s = s.replace("&", "").replace("*", " ").strip()
+    # Remove all const/volatile tokens regardless of position
+    tokens = [tok for tok in s.split() if tok not in ("const", "volatile")]
+    s = " ".join(tokens).strip()
+    # Collapse spaces
+    while "  " in s:
+        s = s.replace("  ", " ")
     return s
 
 
@@ -139,9 +147,34 @@ def _is_floating(t: str) -> bool:
     return ts in {"float", "double", "long double"}
 
 
+def _normalize_spaces(s: str) -> str:
+    s = s.replace(" &", "&").replace("& ", "&")
+    s = s.replace(" *", "*").replace("* ", "*")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+def _pointer_left_part(sp: str) -> str:
+    idx = sp.find("*")
+    return sp if idx < 0 else sp[:idx]
+
 def _is_c_char_ptr(t: CppType) -> bool:
-    ts = _strip_cv_and_class_kw(t.spelling)
-    return "char*" in ts or "char *" in ts or ts == "char*" or ts.endswith("char*")
+    """
+    Detect any char* (const or non-const) using pointer flag and base identifier.
+    """
+    return bool(t.is_pointer and _base_identifier(t.spelling) == "char")
+
+def _is_c_char_ptr_const(t: CppType) -> bool:
+    """
+    Detect char const* / const char* (pointer-to-const char), not const pointer to char.
+    """
+    if not _is_c_char_ptr(t):
+        return False
+    s = _normalize_spaces(_strip_cv_and_class_kw(t.spelling))
+    left = _pointer_left_part(s)
+    toks = left.split()
+    # If 'const' appears before the first '*', it's pointer-to-const
+    return "const" in toks
 
 
 def _is_std_string(spelling: str) -> bool:
@@ -151,6 +184,37 @@ def _is_std_string(spelling: str) -> bool:
         or s.startswith("std::__cxx11::basic_string<char")
         or s.startswith("std::basic_string<char")
     )
+
+def _is_primitive_base_type(name: str) -> bool:
+    """
+    Return True if the base identifier corresponds to a Godot-supported primitive scalar.
+    """
+    n = _strip_cv_and_class_kw(name)
+    return _is_integral(n) or _is_floating(n) or n in {"bool", "char", "wchar_t"}
+
+def _is_pointer_to_primitive(t: CppType) -> bool:
+    """
+    True for pointers to primitive scalar types (e.g., double*, int*), which should not use opaque handles.
+    """
+    return bool(t.is_pointer and _is_primitive_base_type(_base_identifier(t.spelling)))
+
+def _match_occt_handle_type(spelling: str) -> Optional[str]:
+    """
+    Detect OCCT handle smart pointers, e.g. 'opencascade::handle<T>' or 'Handle<T>'.
+    Returns the canonical handle type string if matched, else None.
+    """
+    s = _strip_cv_and_class_kw(spelling or "")
+    ss = re.sub(r"\s+", "", s)  # remove spaces
+    # Common patterns (case-insensitive for 'handle')
+    # e.g., 'opencascade::handle<Geom_Curve>' or 'Handle<Geom_Curve>'
+    m = re.search(r"(?:^|::)(?:opencascade::)?handle<([^>]+)>", ss, re.IGNORECASE)
+    if m:
+        # Reconstruct handle type using the original (non-space-stripped) substring
+        inner = m.group(1)
+        # Try to rebuild a normalized handle type string
+        # Prefer the lowercase opencascade::handle form for canonicalization
+        return f"opencascade::handle<{inner}>"
+    return None
 
 
 # --------------------------
@@ -464,17 +528,20 @@ class TypeMapper:
 
     def _wrapped_param_mapping_ptr(self, t: CppType, pname: str, native_base: str, wrapper_name: str) -> MappedType:
         """
-        Expose `Ref<Wrapper>` while passing `native*` to impl, using get_impl().
+        Expose `Ref<Wrapper>` while passing native pointer/reference to impl via __ocgd_get_impl().
         """
         pre: List[str] = []
-        expr = f"({pname}.is_valid() ? {pname}->get_impl() : nullptr)"
+        if t.is_reference:
+            expr = f"*reinterpret_cast<{native_base}*>(__ocgd_get_impl({{var}}.ptr()))"
+        else:
+            expr = f"reinterpret_cast<{native_base}*>(__ocgd_get_impl({{var}}.ptr()))"
         return MappedType(
             native_spelling=_strip_cv_and_class_kw(t.spelling),
             exposed_spelling=f"godot::Ref<{wrapper_name}>",
             kind=MappedKind.WRAPPED_CLASS,
             to_native_expr=expr,
             pre_call_lines=pre,
-            notes=f"Bridge Ref<{wrapper_name}> -> {native_base}* using get_impl()",
+            notes=f"Bridge Ref<{wrapper_name}> -> {native_base}{'&' if t.is_reference else '*'} via __ocgd_get_impl()",
         )
 
     def _wrapped_return_mapping_ptr(self, t: CppType, native_base: str, wrapper_name: str) -> MappedType:
@@ -482,20 +549,14 @@ class TypeMapper:
         Expose `Ref<Wrapper>` and wrap a returned `native*` with set_impl(ptr, false).
         Ownership is not taken by default to avoid double delete.
         """
-        code = (
-            f"{{\n"
-            f"    godot::Ref<{wrapper_name}> __out; __out.instantiate();\n"
-            f"    __out->set_impl({{expr}}, /*p_take_ownership=*/false);\n"
-            f"    return __out;\n"
-            f"}}"
-        )
+        expr = f"__ocgd_make_from_impl(reinterpret_cast<void*>({{expr}}))"
         return MappedType(
             native_spelling=_strip_cv_and_class_kw(t.spelling),
             exposed_spelling=f"godot::Ref<{wrapper_name}>",
             kind=MappedKind.WRAPPED_CLASS,
-            from_native_expr=code,
+            from_native_expr=expr,
             default_exposed_value=f"godot::Ref<{wrapper_name}>()",
-            notes=f"Wrap returned {native_base}* in Ref<{wrapper_name}> without taking ownership",
+            notes=f"Wrap returned {native_base}* into Ref<{wrapper_name}> via __ocgd_make_from_impl()",
         )
 
     def _opaque_handle_return_mapping_ptr(self, t: CppType) -> MappedType:
@@ -511,8 +572,7 @@ class TypeMapper:
               static void release(uint64_t handle);
           };
         """
-        base = _base_identifier(t.spelling)
-        base_norm = _strip_cv_and_class_kw(base)
+        base_norm = _base_identifier(t.spelling)
         return MappedType(
             native_spelling=_strip_cv_and_class_kw(t.spelling),
             exposed_spelling="uint64_t",
@@ -533,13 +593,47 @@ class TypeMapper:
         if _is_integral(t.spelling) or _is_floating(t.spelling):
             return self._primitive_mapping(t)
 
-        # Godot String mapping for char* and const char*
-        if _is_c_char_ptr(t):
+        # Godot String mapping only for const char* (pointer-to-const)
+        if _is_c_char_ptr_const(t):
             return self._string_param_mapping_c_char_ptr(t, pname)
+        # Writable char* buffers should not be mapped to String; expose as intptr_t
+        if _is_c_char_ptr(t):
+            return MappedType(
+                native_spelling=_strip_cv_and_class_kw(t.spelling),
+                exposed_spelling="intptr_t",
+                kind=MappedKind.PRIMITIVE,
+                to_native_expr="reinterpret_cast<char*>(static_cast<intptr_t>({var}))",
+                default_exposed_value="0",
+                notes="Map writable char* parameter to intptr_t for Variant API",
+            )
 
         # std::string mapping if enabled
         if self.config.enable_std_string and _is_std_string(t.spelling):
             return self._string_param_mapping_std_string(t, pname)
+
+        # OCCT handle<T> parameter mapping -> opaque handle (uint64_t)
+        # Pass native as a dereferenced handle from the registry
+        handle_type = _match_occt_handle_type(t.spelling)
+        if handle_type:
+            return MappedType(
+                native_spelling=_strip_cv_and_class_kw(t.spelling),
+                exposed_spelling="uint64_t",
+                kind=MappedKind.OPAQUE_HANDLE,
+                to_native_expr=f"*OpaqueHandleRegistry<{handle_type}>::get({{var}})",
+                notes=f"OCCT handle parameter mapped to opaque handle (registry of {handle_type})",
+            )
+
+        # void* parameter mapping -> intptr_t exposed
+        # Ensures typedef aliases like Standard_Address (void*) are exposed as intptr_t
+        if t.is_pointer and _base_identifier(t.spelling) == "void":
+            return MappedType(
+                native_spelling=_strip_cv_and_class_kw(t.spelling),
+                exposed_spelling="intptr_t",
+                kind=MappedKind.PRIMITIVE,
+                to_native_expr="reinterpret_cast<void*>(static_cast<intptr_t>({var}))",
+                default_exposed_value="0",
+                notes="Map void* parameter to intptr_t for Variant API"
+            )
 
         # Custom rule by base identifier
         custom = self._match_custom_rule(t)
@@ -555,18 +649,27 @@ class TypeMapper:
                 notes=custom.notes,
             )
 
-        # Wrapped class bridging (pointer parameters)
+        # Wrapped class bridging (pointer/reference parameters)
         base = _base_identifier(t.spelling)
         base_abs = _absolute_qualified_name(base)
-        if t.is_pointer and base_abs in self.known_wrapped and self.config.use_wrapped_param_bridge:
+        if (t.is_pointer or t.is_reference) and base_abs in self.known_wrapped and self.config.use_wrapped_param_bridge:
             wrapper = self.known_wrapped[base_abs]
             return self._wrapped_param_mapping_ptr(t, pname, base_abs, wrapper)
 
         # Unknown pointer/reference param: map pointers to opaque handles if enabled; references unsupported
         if t.is_pointer:
+            # Avoid opaque handles for pointers to primitive scalars (e.g., double*, int*): use intptr_t instead
+            if _is_pointer_to_primitive(t):
+                return MappedType(
+                    native_spelling=_strip_cv_and_class_kw(t.spelling),
+                    exposed_spelling="intptr_t",
+                    kind=MappedKind.PRIMITIVE,
+                    to_native_expr="reinterpret_cast<{}*>(static_cast<intptr_t>({{var}}))".format(_base_identifier(t.spelling)),
+                    default_exposed_value="0",
+                    notes="Pointer to primitive mapped to intptr_t (no opaque handle needed)",
+                )
             if self.config.enable_opaque_handles:
-                base = _base_identifier(t.spelling)
-                base_norm = _strip_cv_and_class_kw(base)
+                base_norm = _base_identifier(t.spelling)
                 return MappedType(
                     native_spelling=_strip_cv_and_class_kw(t.spelling),
                     exposed_spelling="uint64_t",
@@ -613,6 +716,30 @@ class TypeMapper:
         if self.config.enable_std_string and _is_std_string(t.spelling):
             return self._string_return_mapping_std_string(t)
 
+        # OCCT handle<T> return mapping -> opaque handle (uint64_t)
+        handle_type = _match_occt_handle_type(t.spelling)
+        if handle_type:
+            return MappedType(
+                native_spelling=_strip_cv_and_class_kw(t.spelling),
+                exposed_spelling="uint64_t",
+                kind=MappedKind.OPAQUE_HANDLE,
+                from_native_expr=f"OpaqueHandleRegistry<{handle_type}>::put(new {handle_type}({{expr}}))",
+                default_exposed_value="0",
+                notes=f"OCCT handle return mapped to opaque handle (registry of {handle_type})",
+            )
+
+        # void* return mapping -> intptr_t exposed
+        # Ensures typedef aliases like Standard_Address (void*) are exposed as intptr_t
+        if t.is_pointer and _base_identifier(t.spelling) == "void":
+            return MappedType(
+                native_spelling=_strip_cv_and_class_kw(t.spelling),
+                exposed_spelling="intptr_t",
+                kind=MappedKind.PRIMITIVE,
+                from_native_expr="reinterpret_cast<intptr_t>({expr})",
+                default_exposed_value="0",
+                notes="Map void* return to intptr_t for Variant API"
+            )
+
         # Custom rule
         custom = self._match_custom_rule(t)
         if custom:
@@ -634,8 +761,17 @@ class TypeMapper:
             wrapper = self.known_wrapped[base_abs]
             return self._wrapped_return_mapping_ptr(t, base_abs, wrapper)
 
-        # Unknown pointer return -> opaque handle if enabled
+        # Unknown pointer return -> opaque handle if enabled (but avoid primitives)
         if t.is_pointer and self.config.enable_opaque_handles:
+            if _is_pointer_to_primitive(t):
+                return MappedType(
+                    native_spelling=_strip_cv_and_class_kw(t.spelling),
+                    exposed_spelling="intptr_t",
+                    kind=MappedKind.PRIMITIVE,
+                    from_native_expr="reinterpret_cast<intptr_t>({expr})",
+                    default_exposed_value="0",
+                    notes="Pointer to primitive mapped to intptr_t (no opaque handle needed)",
+                )
             return self._opaque_handle_return_mapping_ptr(t)
 
         # Unknown reference or value class return: not supported (copy/ownership unclear)
