@@ -1,0 +1,139 @@
+#pragma once
+/**
+ * Opaque handle registry (header-only).
+ *
+ * This optional runtime helper provides a simple way to convert native pointers
+ * to stable, process-unique handles (uint64_t) and back again. It is designed
+ * for use with generated bindings that choose to expose unknown native pointers
+ * as opaque handles to Godot (Variant-compatible).
+ *
+ * Usage:
+ *   // Register a native pointer and obtain an opaque handle:
+ *   uint64_t h = OpaqueHandleRegistry<MyType>::put(ptr);
+ *
+ *   // Later, resolve the handle back to a pointer:
+ *   MyType* p = OpaqueHandleRegistry<MyType>::get(h);
+ *
+ *   // Optionally, release a handle when it is no longer needed:
+ *   OpaqueHandleRegistry<MyType>::release(h);
+ *
+ * Notes:
+ * - This registry does NOT manage the lifetime of the underlying pointers.
+ *   You must ensure the native pointer remains valid while a handle referencing
+ *   it is in use. Releasing a handle does not delete the pointer.
+ * - Handle value 0 is reserved for nullptr.
+ * - Thread-safe via per-type mutex. Each T has its own handle space.
+ * - If the same pointer is registered multiple times, the same handle is returned.
+ *
+ * This file is provided as a template by the binding generator. You can copy it
+ * into your project and include it where needed, or the generator may emit it
+ * for you depending on configuration.
+ */
+
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
+#include <type_traits>
+
+template <class T>
+struct OpaqueHandleRegistry {
+    static_assert(std::is_object<T>::value, "OpaqueHandleRegistry<T>: T must be an object type");
+
+    // Register a pointer and obtain a handle. If ptr is nullptr, returns 0.
+    // If the pointer was previously registered, returns the existing handle.
+    static uint64_t put(T* ptr) {
+        if (!ptr) {
+            return 0; // reserved null handle
+        }
+        std::lock_guard<std::mutex> _lg(mutex_());
+        auto it = reverse_().find(ptr);
+        if (it != reverse_().end()) {
+            return it->second;
+        }
+        uint64_t h = next_handle_();
+        // Avoid returning 0 (reserved). Should be extremely unlikely with ++.
+        if (h == 0) {
+            h = next_handle_();
+            if (h == 0) {
+                // In pathological case, fall back to 1
+                h = 1;
+                counter_() = 1;
+            }
+        }
+        table_().emplace(h, ptr);
+        reverse_().emplace(ptr, h);
+        return h;
+    }
+
+    // Resolve a handle to a pointer. Returns nullptr if handle is 0 or unknown.
+    static T* get(uint64_t handle) {
+        if (handle == 0) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> _lg(mutex_());
+        auto it = table_().find(handle);
+        return (it != table_().end()) ? it->second : nullptr;
+    }
+
+    // Release a handle from the registry. Does NOT delete the underlying pointer.
+    // Returns true if the handle existed and was removed, false otherwise.
+    static bool release(uint64_t handle) {
+        if (handle == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> _lg(mutex_());
+        auto it = table_().find(handle);
+        if (it == table_().end()) {
+            return false;
+        }
+        T* ptr = it->second;
+        table_().erase(it);
+        auto rit = reverse_().find(ptr);
+        if (rit != reverse_().end()) {
+            reverse_().erase(rit);
+        }
+        return true;
+    }
+
+    // Remove all entries for this T. Does NOT delete underlying pointers.
+    static void clear() {
+        std::lock_guard<std::mutex> _lg(mutex_());
+        table_().clear();
+        reverse_().clear();
+        // Leave the counter as-is to avoid handle reuse collisions across clear().
+    }
+
+    // Number of active handles for this T.
+    static std::size_t size() {
+        std::lock_guard<std::mutex> _lg(mutex_());
+        return table_().size();
+    }
+
+private:
+    // Per-type storage (function-local statics avoid static init order issues)
+    static std::mutex& mutex_() {
+        static std::mutex m;
+        return m;
+    }
+
+    static std::unordered_map<uint64_t, T*>& table_() {
+        static std::unordered_map<uint64_t, T*> tbl;
+        return tbl;
+    }
+
+    static std::unordered_map<T*, uint64_t>& reverse_() {
+        static std::unordered_map<T*, uint64_t> rev;
+        return rev;
+    }
+
+    static std::atomic<uint64_t>& counter_() {
+        static std::atomic<uint64_t> c{0};
+        return c;
+    }
+
+    static uint64_t next_handle_() {
+        // ++counter so first non-zero value is 1
+        return ++counter_();
+    }
+};

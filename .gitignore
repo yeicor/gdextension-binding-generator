@@ -1,0 +1,9 @@
+# Generated code (during testing)
+/generated/
+
+# Common build output directories
+/dist/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]

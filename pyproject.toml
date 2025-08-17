@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "gdextension-binding-generator"
+version = "0.1.0"
+description = "Fully automated Godot 4.4 GDExtension C++ binding generator using libclang and Jinja2."
+authors = ["Yeicor"]
+license = "MIT"
+readme = "README.md"
+keywords = ["godot", "gdextension", "bindings", "generator", "libclang", "jinja2"]
+repository = "https://github.com/yeicor/gdextension-binding-generator"
+homepage = "https://github.com/yeicor/gdextension-binding-generator"
+include = [
+    "README.md",
+    "LICENSE"
+]
+
+[tool.poetry.dependencies]
+python = ">=3.8,<3.13"
+clang = ">=14,<19"
+Jinja2 = "^3.1"
+
+[tool.poetry.scripts]
+generate-godot-bindings = "gdextension_binding_generator.generate_bindings:main"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.0"
+isort = "^5.13"
+mypy = "^1.10"
+ruff = "^0.6.0"
+types-Jinja2 = "^2.11.9"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
