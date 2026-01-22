@@ -1,4 +1,4 @@
-# GDExtension Binding Generator (Godot 4.4)
+# WIP: GDExtension Binding Generator (Godot 4.4)
 
 This repository contains a modular, maintainable, and fully automated binding generator to scaffold Godot 4.4 GDExtension wrappers for large C/C++ libraries (e.g., OpenCASCADE). It discovers classes and methods from your headers via libclang and emits:
 
